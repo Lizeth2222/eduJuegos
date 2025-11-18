@@ -1,11 +1,12 @@
 import 'dart:convert';
+import 'package:edujuegos/services/auth_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/user_model.dart';
 
 /// Servicio de gestión de grupos
-/// Maneja creación, membresía y chat local de grupos
 class GroupService extends ChangeNotifier {
+  final AuthService _authService;
   List<GroupModel> _groups = [];
   Map<String, List<ChatMessage>> _groupMessages = {};
   bool _isLoading = false;
@@ -13,6 +14,9 @@ class GroupService extends ChangeNotifier {
   // Getters
   List<GroupModel> get groups => _groups;
   bool get isLoading => _isLoading;
+
+  /// Constructor que requiere AuthService
+  GroupService(this._authService);
 
   /// Inicializar servicio
   Future<void> initialize() async {
@@ -22,12 +26,16 @@ class GroupService extends ChangeNotifier {
     try {
       await _loadGroups();
       await _loadMessages();
+      // Recalcula los puntos de todos los grupos al iniciar
+      for (var group in _groups) {
+        await _recalculateGroupPoints(group.id);
+      }
     } catch (e) {
       debugPrint('Error inicializando GroupService: $e');
+    } finally {
+      _isLoading = false;
+      notifyListeners();
     }
-
-    _isLoading = false;
-    notifyListeners();
   }
 
   /// Cargar grupos desde SharedPreferences
@@ -114,7 +122,6 @@ class GroupService extends ChangeNotifier {
       };
     }
 
-    // Verificar si ya existe un grupo con ese nombre
     if (_groups.any((g) => g.name.toLowerCase() == name.toLowerCase())) {
       return {
         'success': false,
@@ -125,11 +132,12 @@ class GroupService extends ChangeNotifier {
     final newGroup = GroupModel(
       id: 'group_${DateTime.now().millisecondsSinceEpoch}',
       name: name,
-      memberIds: [creatorId], // El creador es el primer miembro
+      memberIds: [creatorId], 
       createdBy: creatorId,
     );
 
     _groups.add(newGroup);
+    await _recalculateGroupPoints(newGroup.id);
     await _saveGroups();
     notifyListeners();
 
@@ -142,12 +150,11 @@ class GroupService extends ChangeNotifier {
 
   /// Unirse a un grupo
   Future<Map<String, dynamic>> joinGroup(String groupId, String userId) async {
-    final group = _groups.firstWhere(
-          (g) => g.id == groupId,
-      orElse: () => throw Exception('Grupo no encontrado'),
-    );
+    final group = getGroupById(groupId);
+    if (group == null) {
+       return {'success': false, 'message': 'Grupo no encontrado'};
+    }
 
-    // Verificar si ya es miembro
     if (group.memberIds.contains(userId)) {
       return {
         'success': false,
@@ -155,7 +162,6 @@ class GroupService extends ChangeNotifier {
       };
     }
 
-    // Verificar si está lleno
     if (group.isFull) {
       return {
         'success': false,
@@ -164,6 +170,7 @@ class GroupService extends ChangeNotifier {
     }
 
     group.addMember(userId);
+    await _recalculateGroupPoints(groupId);
     await _saveGroups();
     notifyListeners();
 
@@ -175,19 +182,48 @@ class GroupService extends ChangeNotifier {
 
   /// Salir de un grupo
   Future<void> leaveGroup(String groupId, String userId) async {
-    final group = _groups.firstWhere((g) => g.id == groupId);
+    final group = getGroupById(groupId);
+    if (group == null) return;
+
     group.removeMember(userId);
 
-    // Si no quedan miembros, eliminar el grupo
     if (group.memberIds.isEmpty) {
       _groups.removeWhere((g) => g.id == groupId);
       _groupMessages.remove(groupId);
+    } else {
+      await _recalculateGroupPoints(groupId);
     }
 
     await _saveGroups();
     await _saveMessages();
     notifyListeners();
   }
+
+  /// Recalcular los puntos totales de un grupo.
+  Future<void> _recalculateGroupPoints(String groupId) async {
+    final group = getGroupById(groupId);
+    if (group == null) return;
+
+    int total = 0;
+    for (var memberId in group.memberIds) {
+      final user = _authService.getUserById(memberId);
+      if (user != null) {
+        total += user.points;
+      }
+    }
+    group.totalPoints = total;
+  }
+
+  /// Actualiza los puntos de todos los grupos donde un usuario es miembro.
+  Future<void> updateUserPointsInGroups(String userId) async {
+    final userGroups = getUserGroups(userId);
+    for (var group in userGroups) {
+      await _recalculateGroupPoints(group.id);
+    }
+    await _saveGroups();
+    notifyListeners();
+  }
+
 
   /// Obtener grupos de un usuario
   List<GroupModel> getUserGroups(String userId) {
@@ -211,13 +247,11 @@ class GroupService extends ChangeNotifier {
       message: message.trim(),
     );
 
-    // Agregar mensaje a la lista del grupo
     if (!_groupMessages.containsKey(groupId)) {
       _groupMessages[groupId] = [];
     }
     _groupMessages[groupId]!.add(newMessage);
 
-    // Limitar a 100 mensajes por grupo
     if (_groupMessages[groupId]!.length > 100) {
       _groupMessages[groupId]!.removeAt(0);
     }
@@ -231,17 +265,6 @@ class GroupService extends ChangeNotifier {
     return _groupMessages[groupId] ?? [];
   }
 
-  /// Actualizar puntos totales de un grupo
-  Future<void> updateGroupPoints(String groupId, List<UserModel> members) async {
-    final group = _groups.firstWhere((g) => g.id == groupId);
-
-    // Sumar puntos de todos los miembros
-    group.totalPoints = members.fold(0, (sum, member) => sum + member.points);
-
-    await _saveGroups();
-    notifyListeners();
-  }
-
   /// Obtener ranking de grupos
   List<GroupModel> getGroupRanking() {
     final rankedGroups = List<GroupModel>.from(_groups);
@@ -250,13 +273,33 @@ class GroupService extends ChangeNotifier {
   }
 
   /// Eliminar grupo (solo para creador o docente)
-  Future<void> deleteGroup(String groupId) async {
+  Future<Map<String, dynamic>> deleteGroup(String groupId, String userId) async {
+    final group = getGroupById(groupId);
+    if (group == null) {
+      return {'success': false, 'message': 'El grupo no existe'};
+    }
+
+    final user = _authService.getUserById(userId);
+    if (user == null) {
+      return {'success': false, 'message': 'Usuario no autorizado'};
+    }
+
+    // Solo el creador o un docente puede eliminar el grupo
+    if (group.createdBy != userId && !user.isTeacher) {
+      return {
+        'success': false,
+        'message': 'No tienes permiso para eliminar este grupo 🚫',
+      };
+    }
+
     _groups.removeWhere((g) => g.id == groupId);
     _groupMessages.remove(groupId);
 
     await _saveGroups();
     await _saveMessages();
     notifyListeners();
+
+    return {'success': true, 'message': 'Grupo eliminado correctamente'};
   }
 
   /// Obtener grupo por ID
