@@ -1,21 +1,26 @@
 import 'dart:convert';
 import 'dart:math';
+import 'package:edujuegos/services/auth_service.dart';
+import 'package:edujuegos/services/group_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/user_model.dart';
 
-/// Servicio del juego "Completar la Palabra"
-/// Maneja la lógica del juego, palabras y puntuación
 class GameService extends ChangeNotifier {
+  final AuthService _authService;
+  final GroupService _groupService;
+
   Map<String, List<WordQuestion>> _categories = {};
+  Map<String, List<WordQuestion>> _customWords = {};
+
   WordQuestion? _currentWord;
   Set<String> _guessedLetters = {};
   int _attempts = 0;
-  int _maxAttempts = 6;
+  final int _maxAttempts = 6;
   bool _isLoading = false;
+  bool _isGameFinished = false;
 
-  // Getters
   Map<String, List<WordQuestion>> get categories => _categories;
   List<String> get categoryNames => _categories.keys.toList();
   WordQuestion? get currentWord => _currentWord;
@@ -23,235 +28,201 @@ class GameService extends ChangeNotifier {
   int get attempts => _attempts;
   int get maxAttempts => _maxAttempts;
   bool get isLoading => _isLoading;
+  bool get isGameFinished => _isGameFinished;
 
-  /// Inicializar servicio - cargar categorías y palabras
+  GameService(this._authService, this._groupService);
+
   Future<void> initialize() async {
     _isLoading = true;
     notifyListeners();
-
     try {
-      await _loadCategories();
+      await _loadWords();
     } catch (e) {
       debugPrint('Error inicializando GameService: $e');
+    } finally {
+      _isLoading = false;
+      notifyListeners();
     }
-
-    _isLoading = false;
-    notifyListeners();
   }
 
-  /// Cargar categorías desde archivo JSON o SharedPreferences
-  Future<void> _loadCategories() async {
+  Future<void> _loadWords() async {
+    await _loadCustomWords();
+    await _loadBaseWords();
+  }
+
+  Future<void> _loadBaseWords() async {
     try {
-      // Intentar cargar desde assets
-      final jsonString =
-      await rootBundle.loadString('assets/data/questions.json');
-      final Map<String, dynamic> jsonData = jsonDecode(jsonString);
+      final jsonString = await rootBundle.loadString('assets/data/questions.json');
+      final jsonData = jsonDecode(jsonString) as Map<String, dynamic>;
 
       _categories.clear();
-
       jsonData.forEach((category, words) {
-        final List<WordQuestion> wordList = (words as List)
+        _categories[category] = (words as List)
             .map((w) => WordQuestion.fromJson(w, category))
             .toList();
-        _categories[category] = wordList;
       });
 
-      // También cargar palabras personalizadas del docente
-      await _loadCustomWords();
+      _customWords.forEach((category, customWordList) {
+        _categories.putIfAbsent(category, () => []).addAll(customWordList);
+      });
     } catch (e) {
-      debugPrint('Error cargando categorías: $e');
-      // Si falla, crear categorías por defecto
-      _createDefaultCategories();
+      debugPrint('Error cargando categorías base: $e');
+      if (_categories.isEmpty) _createDefaultCategories();
     }
   }
 
-  /// Cargar palabras personalizadas guardadas por docentes
   Future<void> _loadCustomWords() async {
     final prefs = await SharedPreferences.getInstance();
     final customJson = prefs.getString('custom_words');
+    _customWords.clear();
 
     if (customJson != null) {
-      final Map<String, dynamic> customData = jsonDecode(customJson);
-
+      final customData = jsonDecode(customJson) as Map<String, dynamic>;
       customData.forEach((category, words) {
-        final List<WordQuestion> wordList = (words as List)
+        _customWords[category] = (words as List)
             .map((w) => WordQuestion.fromJson(w, category))
             .toList();
-
-        // Agregar a categoría existente o crear nueva
-        if (_categories.containsKey(category)) {
-          _categories[category]!.addAll(wordList);
-        } else {
-          _categories[category] = wordList;
-        }
       });
     }
   }
 
-  /// Crear categorías por defecto si no se puede cargar el JSON
   void _createDefaultCategories() {
     _categories = {
-      'Animales': [
-        WordQuestion(word: 'GATO', hint: 'Mascota felina', category: 'Animales'),
-        WordQuestion(word: 'PERRO', hint: 'Mejor amigo del hombre', category: 'Animales'),
-      ],
-      'Frutas': [
-        WordQuestion(word: 'MANZANA', hint: 'Roja o verde', category: 'Frutas'),
-        WordQuestion(word: 'PLATANO', hint: 'Amarilla y alargada', category: 'Frutas'),
-      ],
+      'Animales': [WordQuestion(word: 'GATO', hint: 'Mascota felina', category: 'Animales')],
+      'Frutas': [WordQuestion(word: 'MANZANA', hint: 'Roja o verde', category: 'Frutas')],
     };
   }
 
-  /// Iniciar nuevo juego con una categoría
   void startGame(String category) {
-    if (!_categories.containsKey(category) ||
-        _categories[category]!.isEmpty) {
-      debugPrint('Categoría no encontrada: $category');
+    if (!_categories.containsKey(category) || _categories[category]!.isEmpty) {
+      debugPrint('Categoría no válida o vacía: $category');
       return;
     }
 
-    // Seleccionar palabra aleatoria de la categoría
     final random = Random();
     final words = _categories[category]!;
     _currentWord = words[random.nextInt(words.length)];
 
-    // Reiniciar estado del juego
     _guessedLetters.clear();
     _attempts = 0;
-
+    _isGameFinished = false;
     notifyListeners();
   }
 
-  /// Adivinar una letra
-  bool guessLetter(String letter) {
-    if (_currentWord == null) return false;
+  void guessLetter(String letter) {
+    if (_currentWord == null || _isGameFinished) return;
 
     letter = letter.toUpperCase();
-
-    // Si ya fue adivinada, no hacer nada
-    if (_guessedLetters.contains(letter)) {
-      return false;
-    }
+    if (_guessedLetters.contains(letter)) return;
 
     _guessedLetters.add(letter);
 
-    // Si la letra no está en la palabra, aumentar intentos
     if (!_currentWord!.word.contains(letter)) {
       _attempts++;
     }
 
-    notifyListeners();
-    return _currentWord!.word.contains(letter);
-  }
+    final bool won = isGameWon();
+    final bool lost = isGameLost();
 
-  /// Verificar si el juego está ganado
-  bool isGameWon() {
-    if (_currentWord == null) return false;
-
-    // Verificar si todas las letras fueron adivinadas
-    for (var letter in _currentWord!.word.split('')) {
-      if (letter != ' ' && !_guessedLetters.contains(letter)) {
-        return false;
-      }
+    if (won || lost) {
+      endGame(won: won);
     }
 
-    return true;
+    notifyListeners();
   }
 
-  /// Verificar si el juego está perdido
-  bool isGameLost() {
-    return _attempts >= _maxAttempts;
+  Future<void> endGame({required bool won}) async {
+    if (_currentWord == null || _authService.currentUser == null || _isGameFinished) return;
+
+    _isGameFinished = true;
+
+    int points = 0;
+    if (won) {
+      points = calculatePoints();
+      await _authService.addPointsToCurrentUser(points);
+    }
+
+    final history = GameHistory(
+      category: _currentWord!.category,
+      word: _currentWord!.word,
+      pointsEarned: points,
+      completed: won,
+    );
+
+    await _authService.addGameHistoryToCurrentUser(history);
+    // CORREGIDO: Llama a GroupService para actualizar los puntos del grupo
+    await _groupService.updateUserPointsInGroups(_authService.currentUser!.id);
+
+    notifyListeners();
   }
 
-  /// Obtener palabra con guiones para mostrar
+  bool isGameWon() {
+    if (_currentWord == null) return false;
+    return _currentWord!.word.split('').every((l) => l == ' ' || _guessedLetters.contains(l));
+  }
+
+  bool isGameLost() => _attempts >= _maxAttempts;
+
   String getDisplayWord() {
     if (_currentWord == null) return '';
-
-    return _currentWord!.word.split('').map((letter) {
-      if (letter == ' ') return '  '; // Espacio entre palabras
-      return _guessedLetters.contains(letter) ? letter : '_';
+    return _currentWord!.word.split('').map((l) {
+      return l == ' ' ? '  ' : _guessedLetters.contains(l) ? l : '_';
     }).join(' ');
   }
 
-  /// Calcular puntos ganados basado en dificultad
   int calculatePoints() {
     if (_currentWord == null) return 0;
-
-    // Puntos base según longitud de palabra
     int basePoints = _currentWord!.word.replaceAll(' ', '').length * 10;
-
-    // Bonus por pocos intentos
     int attemptBonus = (_maxAttempts - _attempts) * 5;
-
-    // Bonus por categoría difícil
     int categoryBonus = 0;
-    if (_currentWord!.category == 'Historia del Perú' ||
-        _currentWord!.category == 'Matemática') {
+    const hardCategories = ['Historia del Perú', 'Matemática'];
+    if (hardCategories.contains(_currentWord!.category)) {
       categoryBonus = 20;
     }
-
     return basePoints + attemptBonus + categoryBonus;
   }
 
-  /// Agregar palabra personalizada (para docentes)
   Future<void> addCustomWord({
     required String category,
     required String word,
     required String hint,
   }) async {
-    final newWord = WordQuestion(
-      word: word.toUpperCase(),
-      hint: hint,
-      category: category,
-    );
+    final newWord = WordQuestion(word: word.toUpperCase(), hint: hint, category: category);
 
-    // Agregar a categoría existente o crear nueva
-    if (_categories.containsKey(category)) {
-      _categories[category]!.add(newWord);
-    } else {
-      _categories[category] = [newWord];
-    }
+    _categories.putIfAbsent(category, () => []).add(newWord);
+    _customWords.putIfAbsent(category, () => []).add(newWord);
 
-    // Guardar en SharedPreferences
     await _saveCustomWords();
     notifyListeners();
   }
 
-  /// Guardar palabras personalizadas
   Future<void> _saveCustomWords() async {
     final prefs = await SharedPreferences.getInstance();
-
-    // Filtrar solo palabras que no vengan del JSON original
-    // (simplificado: guardar todas las palabras)
     final customData = <String, dynamic>{};
-
-    _categories.forEach((category, words) {
+    _customWords.forEach((category, words) {
       customData[category] = words.map((w) => w.toJson()).toList();
     });
-
     await prefs.setString('custom_words', jsonEncode(customData));
   }
 
-  /// Reiniciar juego
   void resetGame() {
     _currentWord = null;
     _guessedLetters.clear();
     _attempts = 0;
+    _isGameFinished = false;
     notifyListeners();
   }
 
-  /// Obtener estadísticas de juego
   Map<String, int> getStatistics(List<GameHistory> history) {
     int totalGames = history.length;
     int gamesWon = history.where((h) => h.completed).length;
     int totalPoints = history.fold(0, (sum, h) => sum + h.pointsEarned);
-
     return {
       'totalGames': totalGames,
       'gamesWon': gamesWon,
       'gamesLost': totalGames - gamesWon,
       'totalPoints': totalPoints,
-      'winRate': totalGames > 0 ? ((gamesWon / totalGames) * 100).round() : 0,
+      'winRate': totalGames > 0 ? (gamesWon / totalGames * 100).round() : 0,
     };
   }
 }
