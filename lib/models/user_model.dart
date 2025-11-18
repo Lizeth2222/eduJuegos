@@ -4,7 +4,7 @@ class UserModel {
   final String id; // ID único del usuario
   String fullName; // Nombre completo
   final String username; // Nombre de usuario único
-  final String password; // Contraseña (en producción debería estar encriptada)
+  final String passwordHash; // Contraseña hasheada/ofuscada
   final String role; // "estudiante" o "docente"
   String avatar; // Ruta del avatar local
   int points; // Puntos acumulados
@@ -16,7 +16,7 @@ class UserModel {
     required this.id,
     required this.fullName,
     required this.username,
-    required this.password,
+    required this.passwordHash,
     required this.role,
     this.avatar = 'assets/avatars/default.png',
     this.points = 0,
@@ -33,7 +33,7 @@ class UserModel {
       'id': id,
       'fullName': fullName,
       'username': username,
-      'password': password,
+      'passwordHash': passwordHash, // Guardamos el hash
       'role': role,
       'avatar': avatar,
       'points': points,
@@ -49,7 +49,8 @@ class UserModel {
       id: json['id'],
       fullName: json['fullName'],
       username: json['username'],
-      password: json['password'],
+      // Por retrocompatibilidad, si 'password' existe, lo usamos.
+      passwordHash: json['passwordHash'] ?? json['password'] ?? '',
       role: json['role'],
       avatar: json['avatar'] ?? 'assets/avatars/default.png',
       points: json['points'] ?? 0,
